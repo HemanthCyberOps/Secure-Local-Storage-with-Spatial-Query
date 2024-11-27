@@ -1,6 +1,6 @@
 import pandas as pd
 from flask import Flask, request, jsonify
-from paillier import public_key, private_key, EncryptedNumber, encrypt_data, homomorphic_addition,decrypt_data
+from paillier import public_key, private_key, EncryptedNumber, encrypt_data, decrypt_data, homomorphic_addition
 from token_manager import TokenManager
 import os
 
@@ -9,13 +9,26 @@ app = Flask(__name__)
 # Use Redis-backed TokenManager
 token_manager = TokenManager()
 
-# Correct dataset path
-dataset_path = "C:\\Users\\HEMANTH\\CLOUD_SERVER\\modified_healthcare_dataset.csv"
+# Dataset path
+dataset_path = "C:\\Users\\HEMANTH\\CLOUD_SERVER\\Secure-Local-Storage-with-Spatial-Query\\reduced_healthcare_dataset.csv"
 if not os.path.exists(dataset_path):
     raise FileNotFoundError(f"Dataset not found at path: {dataset_path}")
 
 # Load the dataset
 data_store = pd.read_csv(dataset_path)
+
+# Define a scaling factor for floating-point handling
+SCALING_FACTOR = 10**15
+
+
+def scale_float(value):
+    """Scale a floating-point number to an integer."""
+    return int(value * SCALING_FACTOR)
+
+
+def descale_float(value):
+    """Descale an integer to its original floating-point value."""
+    return value / SCALING_FACTOR
 
 
 @app.route('/generate_token', methods=['POST'])
@@ -54,12 +67,10 @@ def knn_query():
         data_store["distance"] = data_store.apply(
             lambda row: ((row["latitude"] - query_lat) ** 2 + (row["longitude"] - query_lon) ** 2) ** 0.5, axis=1
         )
-        knn_results = data_store.nsmallest(k, "distance")[
-            [
-                "name", "age", "gender", "blood_type", "medical_condition",
-                "doctor", "hospital", "insurance_provider", "distance"
-            ]
-        ]
+        knn_results = data_store.nsmallest(k, "distance")[[
+            "name", "age", "gender", "blood_type", "medical_condition",
+            "doctor", "hospital", "insurance_provider", "distance"
+        ]]
         return jsonify({"knn_results": knn_results.to_dict(orient="records")}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -69,8 +80,12 @@ def knn_query():
 def view_encrypted():
     """View encrypted data for a specific field and name."""
     try:
-        global data_store  # Declare global before any reference
-        data_store = pd.read_csv(dataset_path)  # Load the latest dataset
+        token = request.headers.get("Authorization")
+        if not token or not token_manager.validate_access_token(token):
+            return jsonify({"error": "Unauthorized access"}), 401
+
+        global data_store
+        data_store = pd.read_csv(dataset_path)
 
         field = request.json.get("field")
         name = request.json.get("name")
@@ -80,12 +95,10 @@ def view_encrypted():
         if field not in data_store.columns:
             return jsonify({"error": f"Field '{field}' not found in the dataset."}), 400
 
-        # Filter dataset for the given name
         filtered_data = data_store[data_store['name'] == name]
         if filtered_data.empty:
             return jsonify({"error": f"No records found for name '{name}'."}), 404
 
-        # Encrypt the selected field
         encrypted_values = encrypt_data(filtered_data[field].tolist())
         encrypted_result = [str(enc_value.ciphertext()) for enc_value in encrypted_values]
 
@@ -96,6 +109,7 @@ def view_encrypted():
 
 @app.route('/homomorphic_add_two_names', methods=['POST'])
 def homomorphic_add_two_names():
+    """Perform homomorphic addition for billing_amount."""
     try:
         field = request.json.get('field')
         name1 = request.json.get('name1')
@@ -116,13 +130,13 @@ def homomorphic_add_two_names():
         if data_name2.empty:
             return jsonify({"error": f"No records found for name '{name2}'."}), 404
 
-        # Ensure only one record per name is processed
-        if len(data_name1) > 1 or len(data_name2) > 1:
-            return jsonify({"error": "Multiple records found for one or both names. Please ensure unique names."}), 400
+        # Scale the floating-point values for encryption
+        billing1 = scale_float(data_name1[field].iloc[0])
+        billing2 = scale_float(data_name2[field].iloc[0])
 
-        # Encrypt the values for the field
-        encrypted_value1 = encrypt_data(data_name1[field].tolist())[0]
-        encrypted_value2 = encrypt_data(data_name2[field].tolist())[0]
+        # Encrypt the values
+        encrypted_value1 = public_key.encrypt(billing1)
+        encrypted_value2 = public_key.encrypt(billing2)
 
         # Perform homomorphic addition
         encrypted_sum = encrypted_value1 + encrypted_value2
@@ -136,28 +150,41 @@ def homomorphic_add_two_names():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/decrypt', methods=['POST'])
-def decrypt():
-    """Decrypt encrypted values."""
+
+@app.route('/retrieve_homomorphic_plaintext', methods=['POST'])
+def retrieve_homomorphic_plaintext():
+    """Decrypt and retrieve plaintext for a homomorphic addition result."""
+    try:
+        encrypted_sum = request.json.get('encrypted_sum')
+        if not encrypted_sum:
+            return jsonify({"error": "Missing 'encrypted_sum'."}), 400
+
+        # Decrypt the encrypted sum
+        encrypted_number = EncryptedNumber(public_key, int(encrypted_sum))
+        decrypted_scaled_value = private_key.decrypt(encrypted_number)
+
+        # Descale the decrypted value to restore the original floating-point number
+        original_value = descale_float(decrypted_scaled_value)
+
+        return jsonify({"decrypted_value": original_value}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/retrieve_encrypted_plaintext', methods=['POST'])
+def retrieve_encrypted_plaintext():
+    """Decrypt and retrieve plaintext values for encrypted data."""
     try:
         encrypted_data = request.json.get('encrypted_data')
+        if not encrypted_data or not isinstance(encrypted_data, list):
+            return jsonify({"error": "Invalid or missing 'encrypted_data'. Expected a list."}), 400
 
-        # Check if the input is a single ciphertext string
-        if isinstance(encrypted_data, str):
-            encrypted_number = EncryptedNumber(public_key, int(encrypted_data))
-            decrypted_value = private_key.decrypt(encrypted_number)
-            return jsonify({"decrypted_value": decrypted_value}), 200
-        
-        # Check if the input is a list of ciphertext strings
-        elif isinstance(encrypted_data, list):
-            decrypted_values = [
-                private_key.decrypt(EncryptedNumber(public_key, int(text))) for text in encrypted_data
-            ]
-            return jsonify({"decrypted_values": decrypted_values}), 200
-        
-        else:
-            return jsonify({"error": "Invalid or missing 'encrypted_data'. Expected a string or a list."}), 400
+        decrypted_values = [
+            descale_float(private_key.decrypt(EncryptedNumber(public_key, int(ciphertext))))
+            for ciphertext in encrypted_data
+        ]
 
+        return jsonify({"decrypted_values": decrypted_values}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
