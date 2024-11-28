@@ -3,19 +3,22 @@ from flask import Flask, request, jsonify
 from paillier import public_key, private_key, EncryptedNumber, encrypt_data, decrypt_data, homomorphic_addition
 from token_manager import TokenManager
 import os
+import base64
 
 app = Flask(__name__)
 
-# Use Redis-backed TokenManager
+# Initialize Redis-backed TokenManager
 token_manager = TokenManager()
 
 # Dataset path
 dataset_path = "C:\\Users\\HEMANTH\\CLOUD_SERVER\\Secure-Local-Storage-with-Spatial-Query\\reduced_healthcare_dataset.csv"
 if not os.path.exists(dataset_path):
+    print(f"Dataset not found at {dataset_path}. Exiting...")
     raise FileNotFoundError(f"Dataset not found at path: {dataset_path}")
 
 # Load the dataset
 data_store = pd.read_csv(dataset_path)
+print(f"Dataset loaded successfully. Records loaded: {len(data_store)}")
 
 # Define a scaling factor for floating-point handling
 SCALING_FACTOR = 10**15
@@ -23,12 +26,32 @@ SCALING_FACTOR = 10**15
 
 def scale_float(value):
     """Scale a floating-point number to an integer."""
-    return int(value * SCALING_FACTOR)
+    print(f"[DEBUG] Scaling value: {value}")
+    scaled_value = int(value * SCALING_FACTOR)
+    print(f"[DEBUG] Scaled value: {scaled_value}")
+    return scaled_value
 
 
 def descale_float(value):
     """Descale an integer to its original floating-point value."""
-    return value / SCALING_FACTOR
+    print(f"[DEBUG] Descaling value: {value}")
+    descaled_value = value / SCALING_FACTOR
+    print(f"[DEBUG] Descaled value: {descaled_value}")
+    return descaled_value
+
+
+@app.before_request
+def require_authorization():
+    """Require valid access tokens for all endpoints except token generation."""
+    if request.endpoint not in ['generate_token', 'generate_query_token']:
+        token = request.headers.get("Authorization")
+        if not token:
+            print("[DEBUG] Missing Authorization token.")
+            return jsonify({"error": "Unauthorized access. Missing token."}), 401
+        if not token_manager.validate_access_token(token):
+            print("[DEBUG] Invalid or revoked Authorization token.")
+            return jsonify({"error": "Unauthorized access. Invalid or revoked token."}), 401
+        print("[DEBUG] Valid Authorization token provided.")
 
 
 @app.route('/generate_token', methods=['POST'])
@@ -37,7 +60,13 @@ def generate_token():
     user_id = request.json.get('user_id')
     if not user_id:
         return jsonify({"error": "Missing 'user_id'"}), 400
+
+    # Revoke all previous tokens for the user
+    token_manager.revoke_tokens_for_user(user_id)
+
+    # Generate a new token
     token = token_manager.generate_access_token(user_id)
+    print(f"[POSTMAN] Generated token for user '{user_id}': {token}")
     return jsonify({"token": token}), 200
 
 
@@ -48,62 +77,33 @@ def generate_query_token():
     if not token_manager.validate_access_token(access_token):
         return jsonify({"error": "Unauthorized access"}), 401
     query_token = token_manager.generate_query_token(access_token)
+    print(f"[POSTMAN] Generated query token: {query_token} for access token: {access_token}")
     return jsonify({"query_token": query_token}), 200
-
-
-@app.route('/knn_query', methods=['POST'])
-def knn_query():
-    """Perform a KNN query using latitude and longitude."""
-    query_token = request.headers.get("Query-Token")
-    access_token = request.headers.get("Authorization")
-    if not token_manager.validate_query_token(access_token, query_token):
-        return jsonify({"error": "Unauthorized access"}), 401
-
-    try:
-        global data_store
-        data_store = pd.read_csv(dataset_path)
-        query = request.json
-        query_lat, query_lon, k = query["latitude"], query["longitude"], query["k"]
-        data_store["distance"] = data_store.apply(
-            lambda row: ((row["latitude"] - query_lat) ** 2 + (row["longitude"] - query_lon) ** 2) ** 0.5, axis=1
-        )
-        knn_results = data_store.nsmallest(k, "distance")[[
-            "name", "age", "gender", "blood_type", "medical_condition",
-            "doctor", "hospital", "insurance_provider", "distance"
-        ]]
-        return jsonify({"knn_results": knn_results.to_dict(orient="records")}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/view_encrypted', methods=['POST'])
 def view_encrypted():
     """View encrypted data for a specific field and name."""
     try:
-        token = request.headers.get("Authorization")
-        if not token or not token_manager.validate_access_token(token):
-            return jsonify({"error": "Unauthorized access"}), 401
-
-        global data_store
-        data_store = pd.read_csv(dataset_path)
-
         field = request.json.get("field")
         name = request.json.get("name")
+        print(f"[POSTMAN] View Encrypted Request: Field='{field}', Name='{name}'")
 
         if not field or not name:
             return jsonify({"error": "Field and name must be provided."}), 400
-        if field not in data_store.columns:
-            return jsonify({"error": f"Field '{field}' not found in the dataset."}), 400
 
         filtered_data = data_store[data_store['name'] == name]
         if filtered_data.empty:
+            print(f"[DEBUG] No records found for name '{name}'.")
             return jsonify({"error": f"No records found for name '{name}'."}), 404
 
         encrypted_values = encrypt_data(filtered_data[field].tolist())
         encrypted_result = [str(enc_value.ciphertext()) for enc_value in encrypted_values]
+        print(f"[POSTMAN] Encrypted values for '{name}': {encrypted_result}")
 
         return jsonify({"encrypted_data": encrypted_result}), 200
     except Exception as e:
+        print(f"[ERROR] View Encrypted Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -189,5 +189,33 @@ def retrieve_encrypted_plaintext():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/knn_query', methods=['POST'])
+def knn_query():
+    """Perform a KNN query using latitude and longitude."""
+    query_token = request.headers.get("Query-Token")
+    access_token = request.headers.get("Authorization")
+    if not token_manager.validate_query_token(access_token, query_token):
+        return jsonify({"error": "Unauthorized access"}), 401
+
+    try:
+        query = request.json
+        query_lat, query_lon, k = query["latitude"], query["longitude"], query["k"]
+        print(f"[POSTMAN] KNN Query: Latitude={query_lat}, Longitude={query_lon}, K={k}")
+        data_store["distance"] = data_store.apply(
+            lambda row: ((row["latitude"] - query_lat) ** 2 + (row["longitude"] - query_lon) ** 2) ** 0.5, axis=1
+        )
+        knn_results = data_store.nsmallest(k, "distance")[[
+            "name", "age", "gender", "blood_type", "medical_condition",
+            "doctor", "hospital", "insurance_provider", "distance"
+        ]]
+        print(f"[POSTMAN] KNN Results: {knn_results.to_dict(orient='records')}")
+        return jsonify({"knn_results": knn_results.to_dict(orient="records")}), 200
+    except Exception as e:
+        print(f"[ERROR] KNN Query Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
+    print("[INFO] Starting Flask server on port 5001...")
     app.run(port=5001, debug=True)
+
