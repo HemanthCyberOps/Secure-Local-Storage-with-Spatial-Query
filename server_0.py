@@ -9,7 +9,7 @@ app = Flask(__name__)
 token_manager = TokenManager()
 
 # Load the dataset
-dataset_path = "C:\\Users\\HEMANTH\\CLOUD_SERVER\\modified_healthcare_dataset.csv"
+dataset_path = "C:\\Users\\HEMANTH\\CLOUD_SERVER\\Secure-Local-Storage-with-Spatial-Query\\reduced_healthcare_dataset.csv"
 try:
     data_store = pd.read_csv(dataset_path)
     print("Dataset loaded successfully.")

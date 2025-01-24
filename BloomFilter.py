@@ -1,12 +1,11 @@
 import hashlib
 import numpy as np
 
-
 def serialize(element):
     """Serialize complex objects into a consistent string format."""
     if isinstance(element, dict):
-        return str(sorted(element.items()))  # Ensure consistent ordering
-    return str(element)
+        return str(sorted(element.items())).lower()  # Ensure consistent ordering and lowercase
+    return str(element).lower()
 
 
 class MultiLevelBloomFilter:
@@ -28,7 +27,6 @@ class MultiLevelBloomFilter:
             if not bloom_filter.lookup(field, value):
                 return False
         return True
-
 
 class BloomFilter:
     def __init__(self, dimensions=(20, 20, 20), num_hashes=14):
